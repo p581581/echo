@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -45,6 +46,12 @@ type (
 		// Optional. Default value "Bearer".
 		AuthScheme string
 
+		//Defines a function to deal with invalid token.
+		InvalidFunc func(echo.Context, error) error
+
+		//Defines a function to deal with missing token.
+		MissingFunc func(echo.Context) error
+
 		keyFunc jwt.Keyfunc
 	}
 
@@ -56,12 +63,6 @@ const (
 	AlgorithmHS256 = "HS256"
 )
 
-// Errors
-var (
-	ErrJWTMissing = echo.NewHTTPError(http.StatusBadRequest, "missing or malformed jwt")
-	ErrJWTInvalid = echo.NewHTTPError(http.StatusUnauthorized, "invalid or expired jwt")
-)
-
 var (
 	// DefaultJWTConfig is the default JWT auth middleware config.
 	DefaultJWTConfig = JWTConfig{
@@ -71,6 +72,12 @@ var (
 		TokenLookup:   "header:" + echo.HeaderAuthorization,
 		AuthScheme:    "Bearer",
 		Claims:        jwt.MapClaims{},
+		InvalidFunc: func(c echo.Context, err error) error {
+			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+		},
+		MissingFunc: func(c echo.Context) error {
+			return echo.ErrUnauthorized
+		},
 	}
 )
 
@@ -82,7 +89,7 @@ var (
 //
 // See: https://jwt.io/introduction
 // See `JWTConfig.TokenLookup`
-func JWT(key interface{}) echo.MiddlewareFunc {
+func JWT(key []byte) echo.MiddlewareFunc {
 	c := DefaultJWTConfig
 	c.SigningKey = key
 	return JWTWithConfig(c)
@@ -96,7 +103,7 @@ func JWTWithConfig(config JWTConfig) echo.MiddlewareFunc {
 		config.Skipper = DefaultJWTConfig.Skipper
 	}
 	if config.SigningKey == nil {
-		panic("echo: jwt middleware requires signing key")
+		panic("jwt middleware requires signing key")
 	}
 	if config.SigningMethod == "" {
 		config.SigningMethod = DefaultJWTConfig.SigningMethod
@@ -116,7 +123,7 @@ func JWTWithConfig(config JWTConfig) echo.MiddlewareFunc {
 	config.keyFunc = func(t *jwt.Token) (interface{}, error) {
 		// Check the signing method
 		if t.Method.Alg() != config.SigningMethod {
-			return nil, fmt.Errorf("unexpected jwt signing method=%v", t.Header["alg"])
+			return nil, fmt.Errorf("Unexpected jwt signing method=%v", t.Header["alg"])
 		}
 		return config.SigningKey, nil
 	}
@@ -139,15 +146,15 @@ func JWTWithConfig(config JWTConfig) echo.MiddlewareFunc {
 
 			auth, err := extractor(c)
 			if err != nil {
-				return err
+				// return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+				return config.InvalidFunc(c, err)
 			}
 			token := new(jwt.Token)
 			// Issue #647, #656
 			if _, ok := config.Claims.(jwt.MapClaims); ok {
 				token, err = jwt.Parse(auth, config.keyFunc)
 			} else {
-				t := reflect.ValueOf(config.Claims).Type().Elem()
-				claims := reflect.New(t).Interface().(jwt.Claims)
+				claims := reflect.ValueOf(config.Claims).Interface().(jwt.Claims)
 				token, err = jwt.ParseWithClaims(auth, claims, config.keyFunc)
 			}
 			if err == nil && token.Valid {
@@ -155,11 +162,8 @@ func JWTWithConfig(config JWTConfig) echo.MiddlewareFunc {
 				c.Set(config.ContextKey, token)
 				return next(c)
 			}
-			return &echo.HTTPError{
-				Code:     ErrJWTInvalid.Code,
-				Message:  ErrJWTInvalid.Message,
-				Internal: err,
-			}
+			// return echo.ErrUnauthorized
+			return config.MissingFunc(c)
 		}
 	}
 }
@@ -172,7 +176,7 @@ func jwtFromHeader(header string, authScheme string) jwtExtractor {
 		if len(auth) > l+1 && auth[:l] == authScheme {
 			return auth[l+1:], nil
 		}
-		return "", ErrJWTMissing
+		return "", errors.New("Missing or invalid jwt in the request header")
 	}
 }
 
@@ -181,7 +185,7 @@ func jwtFromQuery(param string) jwtExtractor {
 	return func(c echo.Context) (string, error) {
 		token := c.QueryParam(param)
 		if token == "" {
-			return "", ErrJWTMissing
+			return "", errors.New("Missing jwt in the query string")
 		}
 		return token, nil
 	}
@@ -192,7 +196,7 @@ func jwtFromCookie(name string) jwtExtractor {
 	return func(c echo.Context) (string, error) {
 		cookie, err := c.Cookie(name)
 		if err != nil {
-			return "", ErrJWTMissing
+			return "", errors.New("Missing jwt in the cookie")
 		}
 		return cookie.Value, nil
 	}
